@@ -198,7 +198,7 @@ export default function App() {
       </>}
       {page==='form' && <>
         <Text style={s.section}>{editing?'EDITAR EVENTO':'NUEVO EVENTO'}</Text>
-        <Text style={s.subtitle}>Completa los datos. Esta demo guarda los cambios sólo en memoria.</Text>
+        <Text style={s.subtitle}>Completa los datos. Los cambios se guardan en DynamoDB.</Text>
         <View style={s.form}>
           <Text style={s.label}>ARTISTA *</Text>
           <TextInput accessibilityLabel="Artista" placeholder="Ej. TECHNO TITANS" placeholderTextColor="#777" style={s.input} value={artist} onChangeText={setArtist}/>
