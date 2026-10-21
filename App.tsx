@@ -1,7 +1,48 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { SafeAreaView, ScrollView, View, Text, TextInput, Pressable, StyleSheet, useWindowDimensions } from 'react-native';
-import { initialEvents, FestivalEvent, EventStatus } from './src/data';
+import { Amplify } from 'aws-amplify';
+import { generateClient } from 'aws-amplify/data';
+import outputs from './amplify_outputs.json';
+import type { Schema } from './amplify/data/resource';
+import { initialEvents, type FestivalEvent, type EventStatus } from './src/data';
 import { theme as c } from './src/theme';
+
+Amplify.configure(outputs);
+const client = generateClient<Schema>();
+let seedEventsPromise: Promise<void> | undefined;
+
+async function seedEventsIfNeeded() {
+  if (!seedEventsPromise) {
+    seedEventsPromise = Promise.all(initialEvents.map(event => client.models.Event.create({
+      id: event.id,
+      artist: event.artist,
+      space: event.space,
+      time: event.time,
+      status: event.status,
+    }))).then(results => {
+      if (results.some(result => result.errors?.length || !result.data)) {
+        throw new Error('No se pudieron crear los eventos de ejemplo.');
+      }
+    });
+  }
+
+  try {
+    await seedEventsPromise;
+  } catch (error) {
+    seedEventsPromise = undefined;
+    throw error;
+  }
+}
+
+function fromModel(event: Schema['Event']['type']): FestivalEvent {
+  return {
+    id: event.id,
+    artist: event.artist,
+    space: event.space,
+    time: event.time,
+    status: event.status as EventStatus,
+  };
+}
 
 type Page = 'dashboard' | 'events' | 'form';
 const stages = ['MAIN STAGE', 'GARDEN', 'WAREHOUSE', 'RIVER STAGE'];
@@ -32,7 +73,8 @@ export default function App() {
   const {width} = useWindowDimensions();
   const wide = width > 860;
   const [page,setPage] = useState<Page>('dashboard');
-  const [events,setEvents] = useState<FestivalEvent[]>(initialEvents);
+  const [events,setEvents] = useState<FestivalEvent[]>([]);
+  const [loading,setLoading] = useState(true);
   const [search,setSearch] = useState('');
   const [filter,setFilter] = useState('TODOS');
   const [editing,setEditing] = useState<string | null>(null);
@@ -42,17 +84,79 @@ export default function App() {
   const [status,setStatus] = useState<EventStatus>('CONFIRMED');
   const [notice,setNotice] = useState('');
 
+  useEffect(() => {
+    let active = true;
+
+    async function loadEvents() {
+      try {
+        let result = await client.models.Event.list();
+        if (result.errors?.length) throw new Error('No se pudieron cargar los eventos.');
+
+        if (result.data.length === 0) {
+          await seedEventsIfNeeded();
+          result = await client.models.Event.list();
+          if (result.errors?.length) throw new Error('No se pudieron cargar los eventos.');
+        }
+
+        if (active) setEvents(result.data.map(fromModel));
+      } catch {
+        if (active) setNotice('No se pudieron cargar los eventos. Comprueba la conexión.');
+      } finally {
+        if (active) setLoading(false);
+      }
+    }
+
+    loadEvents();
+    return () => { active = false; };
+  }, []);
+
   const filtered = useMemo(() => events.filter(e => (filter === 'TODOS' || e.space === filter) && (e.artist.toLowerCase().includes(search.toLowerCase()) || e.id.toLowerCase().includes(search.toLowerCase()))),[events,search,filter]);
   const openNew = () => {setEditing(null);setArtist('');setSpace(stages[0]);setTime('21:45');setStatus('CONFIRMED');setNotice('');setPage('form');};
   const openEdit = (e: FestivalEvent) => {setEditing(e.id);setArtist(e.artist);setSpace(e.space);setTime(e.time);setStatus(e.status);setNotice('');setPage('form');};
-  const save = () => {
+  const save = async () => {
     if(!artist.trim() || !/^([01]\d|2[0-3]):[0-5]\d$/.test(time)){setNotice('Introduce un artista y una hora válida (HH:MM).');return;}
-    if(editing){setEvents(v => v.map(e => e.id === editing ? {...e,artist:artist.trim().toUpperCase(),space,time,status} : e));setNotice('Evento actualizado (datos locales).');}
-    else {const id='EVT-'+Date.now().toString().slice(-7);setEvents(v=>[{id,artist:artist.trim().toUpperCase(),space,time,status},...v]);setNotice('Evento creado (datos locales).');}
-    setPage('events');
+    setNotice('');
+    const event = {artist:artist.trim().toUpperCase(),space,time,status};
+    try {
+      if(editing){
+        const result = await client.models.Event.update({id:editing,...event});
+        if(result.errors?.length || !result.data) throw new Error('No se pudo actualizar el evento.');
+        setEvents(v => v.map(e => e.id === editing ? fromModel(result.data!) : e));
+        setNotice('Evento actualizado.');
+      } else {
+        const result = await client.models.Event.create(event);
+        if(result.errors?.length || !result.data) throw new Error('No se pudo crear el evento.');
+        setEvents(v => [fromModel(result.data!),...v]);
+        setNotice('Evento creado.');
+      }
+      setPage('events');
+    } catch {
+      setNotice(editing ? 'No se pudo actualizar el evento.' : 'No se pudo crear el evento.');
+    }
   };
-  const changeStatus = (id:string) => {setEvents(v=>v.map(e=>e.id===id?{...e,status:e.status==='CONFIRMED'?'DELAYED':e.status==='DELAYED'?'CANCELLED':'CONFIRMED'}:e));setNotice('Estado actualizado localmente.');};
-  const remove = (id:string) => {setEvents(v=>v.filter(e=>e.id!==id));setNotice('Evento eliminado localmente.');};
+  const changeStatus = async (id:string) => {
+    const event = events.find(e => e.id === id);
+    if (!event) return;
+    const nextStatus: EventStatus = event.status === 'CONFIRMED' ? 'DELAYED' : event.status === 'DELAYED' ? 'CANCELLED' : 'CONFIRMED';
+    try {
+      const result = await client.models.Event.update({id,status:nextStatus});
+      if (result.errors?.length || !result.data) throw new Error('No se pudo cambiar el estado.');
+      setEvents(v=>v.map(e=>e.id===id?fromModel(result.data!):e));
+      setNotice('Estado actualizado.');
+    } catch {
+      setNotice('No se pudo cambiar el estado.');
+    }
+  };
+  const remove = async (id:string) => {
+    try {
+      const result = await client.models.Event.delete({id});
+      if (result.errors?.length || !result.data) throw new Error('No se pudo eliminar el evento.');
+      setEvents(v=>v.filter(e=>e.id!==id));
+      setNotice('Evento eliminado.');
+    } catch {
+      setNotice('No se pudo eliminar el evento.');
+    }
+  };
   const confirmed = events.filter(e=>e.status==='CONFIRMED').length;
   const delayed = events.filter(e=>e.status==='DELAYED').length;
   return <SafeAreaView style={s.root}>
@@ -68,9 +172,10 @@ export default function App() {
       <View style={s.hero}>
         <Text style={s.heroTag}>ZARAGOZA · FESTIVAL OPERATIONS</Text>
         <Text style={[s.heroTitle,wide&&{fontSize:62}]}>THE NIGHT{ '\n' }IS YOURS.</Text>
-        <Text style={s.heroSub}>Gestiona la programación en tiempo real. Demo interactiva sin backend.</Text>
+        <Text style={s.heroSub}>Gestiona la programación del festival con datos persistentes en AWS.</Text>
       </View>
       {page==='dashboard' && <>
+        {loading && <Text style={s.subtitle}>Cargando eventos...</Text>}
         <Text style={s.section}>PANEL DE CONTROL</Text>
         <View style={[s.stats,wide&&{flexDirection:'row'}]}>
           {[[String(events.length).padStart(2,'0'),'EVENTOS',c.white],[String(confirmed).padStart(2,'0'),'CONFIRMADOS',c.green],[String(delayed).padStart(2,'0'),'RETRASADOS',c.amber],['04','ESCENARIOS',c.pink]].map(([num,label,color])=><View key={label} style={[s.stat,wide&&{flex:1}]}><Text style={[s.statNumber,{color}]}>{num}</Text><Text style={s.statLabel}>{label}</Text></View>)}
@@ -81,12 +186,13 @@ export default function App() {
       </>}
       {page==='events' && <>
         <Text style={s.section}>PROGRAMACIÓN</Text>
+        {loading && <Text style={s.subtitle}>Cargando eventos...</Text>}
         <Text style={s.subtitle}>{filtered.length} eventos · filtra y administra el festival</Text>
         <TextInput accessibilityLabel="Buscar artista o ID" placeholder="Buscar artista o ID..." placeholderTextColor="#777" style={s.input} value={search} onChangeText={setSearch}/>
         <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={s.filters}>
           {['TODOS',...stages].map(v=><Pressable key={v} onPress={()=>setFilter(v)} style={[s.filter,filter===v&&s.filterActive]}><Text style={s.filterText}>{v}</Text></Pressable>)}
         </ScrollView>
-        {filtered.length===0&&<Text style={s.subtitle}>No hay eventos con ese filtro.</Text>}
+        {!loading&&filtered.length===0&&<Text style={s.subtitle}>No hay eventos con ese filtro.</Text>}
         {filtered.map(e=><EventCard key={e.id} event={e} onEdit={()=>openEdit(e)} onStatus={()=>changeStatus(e.id)} onDelete={()=>remove(e.id)}/>)}
         <Action label="＋ NUEVO EVENTO" onPress={openNew}/>
       </>}
@@ -106,8 +212,8 @@ export default function App() {
           <Action label="CANCELAR" secondary onPress={()=>setPage('events')}/>
         </View>
       </>}
-      {!!notice && <Text accessibilityRole="alert" style={s.notice}>{notice}</Text>}
-      <View style={s.footer}><Text style={s.footerText}>FESTIVAL CONTROL · FRONTEND DEMO · REACT NATIVE + EXPO</Text><Text style={s.footerText}>NO BACKEND · NO HTTP · NO PERSISTENCIA</Text></View>
+      {!!notice && <Text accessibilityRole="alert" style={[s.notice, (notice.startsWith('No se pudo') || notice.startsWith('No se pudieron')) && {color:c.red}]}>{notice}</Text>}
+      <View style={s.footer}><Text style={s.footerText}>FESTIVAL CONTROL · REACT NATIVE + EXPO</Text><Text style={s.footerText}>AMPLIFY DATA · APPSYNC · DYNAMODB</Text></View>
     </ScrollView>
   </SafeAreaView>;
 }
